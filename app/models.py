@@ -271,6 +271,20 @@ class GraphRegisterRequest(ReviewRequest):
     """
 
 
+class GraphRevisionRequest(ReviewRequest):
+    """A new version of an already registered graph, submitted under its id.
+
+    The body is review-shaped (``nodes`` + ``export``) plus
+    ``expected_version``: the whole submitted graph is validated by exactly
+    the same rules as :class:`ReviewRequest` (a blocked graph is still valid
+    and gets saved). ``expected_version`` must equal the graph's current
+    version; an outdated value rejects the submission as HTTP 409 before
+    anything is stored, and an unknown graph id rejects it as HTTP 404.
+    """
+
+    expected_version: int = Field(ge=0)
+
+
 class GraphPreviewRequest(StrictModel):
     """A preview of a previously registered graph: sample inputs only.
 

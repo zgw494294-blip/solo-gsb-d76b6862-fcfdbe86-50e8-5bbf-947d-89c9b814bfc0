@@ -1,0 +1,26 @@
+{
+  "expected_version": 1,
+  "nodes": [
+    {
+      "id": "users",
+      "type": "source",
+      "columns": [
+        {"name": "uid", "sensitive": false},
+        {"name": "email", "sensitive": false},
+        {"name": "country", "sensitive": false}
+      ]
+    },
+    {"id": "only_cn", "type": "filter", "input": "users",
+     "references": ["country"]},
+    {
+      "id": "export_users",
+      "type": "projection",
+      "input": "only_cn",
+      "columns": [
+        {"name": "user_id", "copy": "uid"},
+        {"name": "bucket", "constant": "ALL"}
+      ]
+    }
+  ],
+  "export": "export_users"
+}

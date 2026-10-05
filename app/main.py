@@ -21,6 +21,7 @@ from .models import (
     ComposeRequest,
     GraphPreviewRequest,
     GraphRegisterRequest,
+    GraphRevisionRequest,
     PackagePurgeRequest,
     PackageReleaseRequest,
     PreviewRequest,
@@ -58,21 +59,27 @@ app = FastAPI(
         "to report the export risks the candidate newly introduces. "
         "Graphs can additionally be registered by id and reviewed/previewed "
         "against a shared, versioned sensitive-column registry that is ORed "
-        "with every graph's in-graph sensitive marks. A registered graph's "
-        "passing small-sample result can be sealed into a pending-release "
-        "export package, released under the current registry generation and "
-        "claimed afterwards — release and claim always serve the sealed "
-        "data, never a different batch. Sealed samples can finally be "
-        "purged by source column: every live package whose export depends "
-        "on a listed column (by the original content and row-influence "
-        "rules, ignoring sensitivity marks) loses its stored rows and "
-        "release record and stays purged for good — release and claim then "
-        "answer 410. Committed registry replacements and sample purges are "
-        "appended to a seq-ordered audit log (stored in the same SQLite "
-        "database, in the same transactions as the changes they describe) "
-        "that can be paged through via GET /api/audit-log."
+        "with every graph's in-graph sensitive marks. A registered graph can "
+        "be revised under the same id: each accepted submission appends a new "
+        "graph_version (an optimistic expected_version guards against lost "
+        "updates); reads and by-id previews always use the latest version, "
+        "while every sealed package stays bound to the version sealed. A "
+        "registered graph's passing small-sample result can be sealed into a "
+        "pending-release export package, released under the current registry "
+        "generation (the release re-reviews the package's bound historical "
+        "version, not the current head) and claimed afterwards — release and "
+        "claim always serve the sealed data, never a different batch. Sealed "
+        "samples can finally be purged by source column: the dependency "
+        "decision runs against the bound historical graph under the original "
+        "content and row-influence rules, ignoring sensitivity marks, and "
+        "every matching live package loses its stored rows and release record "
+        "and stays purged for good — release and claim then answer 410. "
+        "Committed registry replacements and sample purges are appended to a "
+        "seq-ordered audit log (stored in the same SQLite database, in the "
+        "same transactions as the changes they describe) that can be paged "
+        "through via GET /api/audit-log."
     ),
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -147,6 +154,41 @@ async def register_graph(request: GraphRegisterRequest) -> dict[str, object]:
         for node in request.nodes  # type: ignore[attr-defined]
     ]
     return registry.register_graph(raw_nodes, request.export)
+
+
+@app.put("/api/graphs/{graph_id}")
+async def revise_registered_graph(
+    graph_id: str, request: GraphRevisionRequest
+) -> object:
+    # A revision stores the new submission verbatim under the same id; the
+    # engine re-runs the whole-graph validation and the registry layer checks
+    # the optimistic expected_version. A blocked graph is still saved.
+    raw_nodes = [
+        node.model_dump(by_alias=True, exclude_unset=True)
+        for node in request.nodes  # type: ignore[attr-defined]
+    ]
+    try:
+        return registry.revise_graph(
+            graph_id, raw_nodes, request.export, request.expected_version
+        )
+    except registry.GraphNotFound:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "GRAPH_NOT_FOUND",
+                               "message": f"no registered graph with id '{graph_id}'"}},
+        )
+    except registry.StaleVersion as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "VERSION_CONFLICT",
+                    "message": str(exc),
+                    "expected_version": exc.expected,
+                    "current_version": exc.current,
+                }
+            },
+        )
 
 
 @app.get("/api/graphs/{graph_id}")

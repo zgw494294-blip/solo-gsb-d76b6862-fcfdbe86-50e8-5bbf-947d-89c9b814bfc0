@@ -40,17 +40,25 @@
 只提交 `rows`/`conditions`，并以**当前审查结论**作为放行依据，详见下文“登记图与共用敏感列名录”。
 名录与登记图保存在 **SQLite**（Docker Compose 命名卷），重启后仍然可用。
 
-最后，已登记图的小样本结果可以**封存**为**待放行导出包**：`POST /api/graphs/{id}/packages`
-按当前名录与原预演规则跑出样本，**安全才**把 `columns`/`rows` 与**创建代次**存入 SQLite
-（只回包 ID 与创建代次；输入错误或阻断不建包）；`POST /api/packages/{id}/release` 按
-**当前代次**放行（过期 409、当前图阻断 400 且不放行）；`GET /api/packages/{id}` **领取**
-封存数据（不重算）——放行与领取都不得换用另一批数据，名录一变（即使恢复安全）即须重新放行，
-详见下文“待放行导出包：封存 / 放行 / 领取”。
+登记图还可以在**原 ID 下提交新版**：`PUT /api/graphs/{id}` 接收 `expected_version` 与新的
+`nodes`/`export`，沿用整图校验、按**当前名录**审查（**阻断图也能保存**），成功则图版本
+`graph_version` 加一（新图与旧库图都从 **1** 开始），返回图 `id`、`graph_version`、
+`generation` 与 `review`；版本过期返回 **409** `VERSION_CONFLICT`、未知图 **404**。图读取与
+按 ID 预演始终用**最新版**；**改版不改动名录 generation、已封存包的数据与放行状态**。
 
-已封存的样本还可以按**源列清除**：`POST /api/packages/purge` 接收非空源列列表，按原内容
-来源与行影响规则（**不受敏感标记限制**）判断每张登记图的导出是否依赖任一指定列，把依赖包
-在 SQLite 中保存的 `rows` 与放行记录清除并**持久标记为已清除**——已清除包的放行、领取入口
-均返回 410，名录恢复安全或重启也不能恢复，详见下文“按源列清除已封存样本”。
+最后，已登记图的小样本结果可以**封存**为**待放行导出包**：`POST /api/graphs/{id}/packages`
+按当前名录与原预演规则跑出样本，**安全才**把 `columns`/`rows`、**创建代次**与**封存时的图版本**
+存入 SQLite（只回包 ID、`graph_version` 与创建代次；输入错误或阻断不建包）；封存包始终**绑定
+封存时的图版本**，之后改版不会换绑；`POST /api/packages/{id}/release` 按**当前代次**放行
+（过期 409；放行按**绑定的历史图版本**结合当前名录重审，该历史版阻断即 400 且不放行）；
+`GET /api/packages/{id}` **领取**封存数据（不重算，响应带绑定的 `graph_version`）——放行与领取
+都不得换用另一批数据，名录一变（即使恢复安全）即须重新放行，详见下文“待放行导出包：封存 /
+放行 / 领取”。
+
+已封存的样本还可以按**源列清除**：`POST /api/packages/purge` 接收非空源列列表，按包**绑定的
+历史图版本**、依原内容来源与行影响规则（**不受敏感标记限制**）判断导出是否依赖任一指定列，
+把依赖包在 SQLite 中保存的 `rows` 与放行记录清除并**持久标记为已清除**——已清除包的放行、
+领取入口均返回 410，名录恢复安全、图改版或重启也不能恢复，详见下文“按源列清除已封存样本”。
 
 最后，**成功生效的名录替换与样本清除**都会追加一条只含元数据的**审计记录**：两类操作共用
 一条按生效顺序递增的正整数 `seq`，替换记录前后 generation 与增删的源列，清除记录当前
@@ -1141,14 +1149,18 @@ curl -s -i -X POST http://localhost:8080/api/compare \
   条目**互异**（重复为 422），**可以指向尚未登记（任何图都没有）的来源或列**——此时不产生影响；
 * **OR 语义**：某源列只要被图内 `sensitive: true` **或**名录命中，即按敏感处理，二者取并集；
 * **代次（generation）**：名录初始为空、generation 为 `0`；成功整份替换一次加一；
-* **随名录变化**：名录替换成功后，服务**重审全部登记图**，并把**名录、代次、每张图的新结论
-  与一条审计记录在同一事务里一起保存**；写入中途或提交失败都会**整体回滚**——名录、代次、
-  全部结论与审计记录保持旧值，重开数据库后也不变，故障解除后可用原 `expected_generation` 重试，
-  见下文“替换失败：整体回滚与重试”；
-* **持久化**：登记图、名录、代次、审查结论、导出包（含放行记录）与审计日志保存在 SQLite
-  （默认 `data/export-risk.db`，可用环境变量 `RISK_API_DB` 覆盖）；Docker 部署时数据库位于
-  Compose **命名卷**上，容器重启后登记图、名录、导出包与审计记录仍然可用。**旧版数据库升级后
-  审计日志从空开始**（不回填历史），之后的操作正常记 `seq=1、2、…`。
+* **图版本（graph_version）**：新登记的图与旧版数据库迁移来的图都从版本 **1** 开始；
+  `PUT /api/graphs/{id}` 在原 ID 下追加新版，成功一次版本加一。**改版只动图自身**：不改
+  名录 generation，不改任何已封存包绑定的版本、冻结数据与放行状态；
+* **随名录变化**：名录替换成功后，服务**重审全部登记图的最新版**，并把**名录、代次、每张图
+  最新版的新结论与一条审计记录在同一事务里一起保存**；写入中途或提交失败都会**整体回滚**——
+  名录、代次、全部结论与审计记录保持旧值，重开数据库后也不变，故障解除后可用原
+  `expected_generation` 重试，见下文“替换失败：整体回滚与重试”；
+* **持久化**：登记图（含**全部历史版本**）、名录、代次、审查结论、导出包（含绑定图版本与
+  放行记录）与审计日志保存在 SQLite（默认 `data/export-risk.db`，可用环境变量
+  `RISK_API_DB` 覆盖）；Docker 部署时数据库位于 Compose **命名卷**上，容器重启后登记图、
+  版本历史、名录、导出包与审计记录仍然可用。**旧版数据库升级后审计日志从空开始**（不回填
+  历史），旧库中的图与包统一归为**版本 1**，之后的操作正常记 `seq=1、2、…`。
 
 旧接口 `/api/review`、`/api/preview`、`/api/revise`、`/api/prune`、`/api/rename`、
 `/api/compose`、`/api/compare` 的行为**完全不变**：它们只按请求图内的 `sensitive` 标记审查，
@@ -1158,21 +1170,24 @@ curl -s -i -X POST http://localhost:8080/api/compare \
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/graphs` | 登记一张图（请求体与 `/api/review` 完全同构：`nodes` + `export`）。**沿用整图校验**（图无效即以 `/api/review` 的原错误码返回 400，不登记任何内容），按当前名录重审，返回 **201** 与图 `id`、原图、当前 `generation` 与 `review` |
-| `GET` | `/api/graphs/{id}` | 读取登记图：返回**原始 `nodes`/`export`**、当前 `generation`（结论所对应的代次）与该代次下的 `review`；未知 ID 返回 **404** `GRAPH_NOT_FOUND` |
-| `POST` | `/api/graphs/{id}/preview` | 按图 ID 预演，请求体**只含 `rows`、`conditions`**（形状与规则同 `/api/preview`）。复用全部原预演规则（覆盖、键集合、标量、200 行上限等）；放行以**当前审查结论**为准：阻断时返回 **400** `PREVIEW_BLOCKED`，错误体**不含任何样本数据**；成功返回样本并带当前 `generation`；未知 ID 返回 **404** `GRAPH_NOT_FOUND` |
+| `POST` | `/api/graphs` | 登记一张图（请求体与 `/api/review` 完全同构：`nodes` + `export`）。**沿用整图校验**（图无效即以 `/api/review` 的原错误码返回 400，不登记任何内容），按当前名录重审，返回 **201** 与图 `id`、原图、当前 `generation` 与 `review`；新图的 `graph_version` 为 **1** |
+| `PUT` | `/api/graphs/{id}` | **在原 ID 下提交新版**：请求体为 `nodes` + `export` + `expected_version`（非负整数）。**沿用整图校验**（图无效以原错误码返回 400，不写入任何版本），按**当前名录**审查；**阻断图也照常保存**。`expected_version` 须等于当前版本，不符返回 **409** `VERSION_CONFLICT`（带 `expected_version`/`current_version`）且什么都不改；未知 ID 返回 **404** `GRAPH_NOT_FOUND`（先于版本检查）；未知字段为 **422**。成功后版本加一，返回图 `id`、`graph_version`、当前 `generation` 与新 `review`（不返回整图）。**不改名录 generation、已封存包的数据与放行状态** |
+| `GET` | `/api/graphs/{id}` | 读取登记图的**最新版**：返回**原始 `nodes`/`export`**、`graph_version`、当前 `generation`（结论所对应的代次）与该代次下的 `review`；未知 ID 返回 **404** `GRAPH_NOT_FOUND` |
+| `POST` | `/api/graphs/{id}/preview` | 按图 ID 预演，始终使用图的**最新版**，请求体**只含 `rows`、`conditions`**（形状与规则同 `/api/preview`）。复用全部原预演规则（覆盖、键集合、标量、200 行上限等）；放行以**当前审查结论**为准：阻断时返回 **400** `PREVIEW_BLOCKED`，错误体**不含任何样本数据**；成功返回样本并带当前 `generation`；未知 ID 返回 **404** `GRAPH_NOT_FOUND` |
 | `GET` | `/api/sensitive-columns` | 读取当前名录：`{"generation": N, "entries": [...]}`（条目按提交顺序） |
 | `PUT` | `/api/sensitive-columns` | **整份替换**名录：`{"entries": [...], "expected_generation": N}`，条目互异、可空（清空）。`expected_generation` 与当前代次不符时返回 **409** `GENERATION_CONFLICT`（带 `expected_generation`/`current_generation`），不做任何修改、**也不留审计记录**；成功时代次加一、重审全部登记图，并返回新代次、新名录与每张图的新结论 `reviews`（按图 ID）；同一事务还追加一条**审计记录**（前后代次与增删源列，内容完全相同也记一条）；写库异常返回 **500** `INTERNAL`，名录、代次、结论与审计记录全部保持旧值。审计日志读取见 `GET /api/audit-log` |
 | `GET` | `/api/audit-log` | **翻页读取审计日志**：查询参数 `after_seq`（非负，默认 0）、`limit`（1～100，默认 50）、`until_seq`（可选非负）。返回固定截止 `until_seq`、按 `seq` 升序的 `after_seq < seq ≤ until_seq` 记录与 `next_cursor`（末条 seq，空页沿用 `after_seq`）；省略截止时取已提交最大 seq（空库为 0），显式截止超过该值返回 **400** `UNTIL_SEQ_OUT_OF_RANGE`（带 `until_seq`/`max_seq`）；参数越界为 **422** |
 
 ### 并发次序
 
-名录替换与登记、读取、登记图预演、导出包的封存/放行/领取/清除共用同一把进程级锁，按**某个先后
-次序整体生效**：预演要么完全发生在替换之前（旧名录 + 旧结论），要么完全发生在替换之后
-（新名录 + 新结论），绝不会用“新名录 + 旧结论”或“旧名录 + 新结论”放行；替换完成之后，
-任何凭替换前安全结论发起的预演都不能再返回样本数据。导出包同理：封存、放行、领取、清除要么完全
-发生在替换之前、要么完全在其后——绝不会按旧代次放行或领取；替换一旦生效，旧放行代次立即
-失效，领取须先按新代次重新放行。
+名录替换、图改版与登记、读取、登记图预演、导出包的封存/放行/领取/清除共用同一把进程级锁，
+按**某个先后次序整体生效**：改版、封存、名录替换各自要么完全发生在另一个之前、要么完全在
+其后。预演要么完全发生在替换之前（旧名录 + 旧结论），要么完全发生在替换之后（新名录 +
+新结论），绝不会用“新名录 + 旧结论”或“旧名录 + 新结论”放行；排队的替换重审的必然是提交时
+的图最新版。替换完成之后，任何凭替换前安全结论发起的预演都不能再返回样本数据。导出包同理：
+封存、放行、领取、清除要么完全发生在替换或改版之前、要么完全在其后——绝不会按旧代次放行或
+领取；替换一旦生效，旧放行代次立即失效，领取须先按新代次重新放行。封存时图版本与样本一起
+入库，之后改版永不换绑：放行重审与清除依赖判定始终使用包**绑定的历史图版本**。
 
 ### 替换失败：整体回滚与重试
 
@@ -1349,6 +1364,71 @@ curl -s -X PUT http://localhost:8080/api/sensitive-columns \
 > `sensitive` 标记——图内全部为 `false` 时，即使名录已标 `users.email`，旧接口仍判安全、
 > 照常返回样本。名录只作用于登记图与按图 ID 的预演。
 
+### 原 ID 下提交新版：PUT /api/graphs/{id}
+
+登记图可以在**原 ID**下反复提交新版，每次成功提交使 **`graph_version` 加一**（新图与旧库
+迁移图都从 **1** 开始）。请求体在原图（`nodes` + `export`）之外多一个**乐观锁**
+`expected_version`，必须等于图的当前版本：
+
+* **整图校验不变**：新图无效即以 `/api/review` 的原错误码返回 **400**，不写入任何版本；
+  schema 问题（未知字段、缺少 `expected_version`、负数等）为 **422**；
+* **按当前名录审查**：结论对应当前名录 `generation`；**阻断图也是合法图，照样保存**——
+  阻断只影响预演/封存/放行，不影响改版；
+* **版本过期**：`expected_version` 不等于当前版本时返回 **409** `VERSION_CONFLICT`（带
+  `expected_version`/`current_version`），整次什么都不改；
+* **未知图**：ID 不存在返回 **404** `GRAPH_NOT_FOUND`（版本检查之前先判存在性，故未知 ID
+  配任何 `expected_version` 都是 404）；
+* **成功响应**：只返回图 `id`、新 `graph_version`、当前 `generation` 与新 `review`（不回
+  整图）；用 `GET /api/graphs/{id}` 读最新版（响应带 `graph_version`）；
+* **改版只动图**：不推进名录 generation，不动任何已封存包的绑定版本、冻结样本与放行状态；
+  图读取与按 ID 预演此后都用最新版；
+* **失败不留痕**：版本追加与“当前版”指针移动在同一事务提交，写入或提交失败返回 **500**
+  `INTERNAL`，图停留在旧版，重开数据库也不变，可用原 `expected_version` 重试。
+
+```bash
+# 1) 提交版本 2（示例文件：删掉导出列 mail，不再依赖 users.email）
+curl -s -X PUT http://localhost:8080/api/graphs/$GID \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/graph_version_request.json
+# {"id":"<GID>","graph_version":2,"generation":0,
+#  "review":{"export":"export_users","blocked":false,...}}
+
+# 2) 读取：返回最新版内容与 graph_version
+curl -s http://localhost:8080/api/graphs/$GID
+# {"id":"<GID>","nodes":[...版本2...],"export":"export_users",
+#  "graph_version":2,"generation":0,"review":{...}}
+
+# 3) 再用旧 expected_version 提交：409 VERSION_CONFLICT，什么都不改
+curl -s -i -X PUT http://localhost:8080/api/graphs/$GID \
+  -H 'Content-Type: application/json' \
+  -d @examples/graph_version_request.json
+# HTTP/1.1 409 ... {"error":{"code":"VERSION_CONFLICT",
+#   "expected_version":1,"current_version":2,...}}
+
+# 4) 未知图 ID：404 GRAPH_NOT_FOUND（即使 expected_version 也是乱填的）
+curl -s -i -X PUT http://localhost:8080/api/graphs/does-not-exist \
+  -H 'Content-Type: application/json' \
+  -d @examples/graph_version_request.json
+# HTTP/1.1 404 ... {"error":{"code":"GRAPH_NOT_FOUND",...}}
+
+# 5) 阻断图也能保存：把 uid 标为图内敏感列，审查 blocked=true 但版本照常推进
+curl -s -X PUT http://localhost:8080/api/graphs/$GID \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "expected_version": 2,
+  "nodes": [
+    {"id": "users", "type": "source", "columns": [
+      {"name": "uid", "sensitive": true},
+      {"name": "email", "sensitive": false},
+      {"name": "country", "sensitive": false}]},
+    {"id": "export_users", "type": "projection", "input": "users",
+     "columns": [{"name": "user_id", "copy": "uid"}]}],
+  "export": "export_users"
+}'
+# {"id":"<GID>","graph_version":3,"generation":0,
+#  "review":{"...blocked":true,...}}
+```
+
 ## 待放行导出包：封存 / 放行 / 领取
 
 把已登记图的一次**安全**小样本结果**封存**为带 ID 的**待放行导出包**，之后按**当前名录代次**
@@ -1359,15 +1439,18 @@ curl -s -X PUT http://localhost:8080/api/sensitive-columns \
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/graphs/{id}/packages` | **封存**：请求体与按 ID 预演完全同构（只含 `rows`、`conditions`），沿用**当前名录**与全部原预演规则（覆盖、键集合、标量、200 行上限等）。仅当审查**安全**时把 `columns`、`rows` 与**创建代次**存入 SQLite，返回 **201** 且响应体**只含包 `id` 与创建 `generation`**；输入错误（400 原错误码）或阻断（400 `PREVIEW_BLOCKED`，不含样本）都**不建包**；未知图 ID 返回 **404** `GRAPH_NOT_FOUND` |
-| `POST` | `/api/packages/{id}/release` | **放行**：请求体 `{"expected_generation": N}`。`N` 与当前代次不符（过期）返回 **409** `GENERATION_CONFLICT`（带 `expected_generation`/`current_generation`），什么都不记；随后按**当前名录**重审该图，阻断时返回 **400** `RELEASE_BLOCKED`（带 `review`，不含样本）且**不放行**；成功则把**当前代次**保存为**放行代次**，响应体**只含包 `id` 与 `release_generation`**。名录变更后可再次放行（覆盖旧放行代次）；已清除的包返回 **410** `PACKAGE_PURGED`；未知包 ID 返回 **404** `PACKAGE_NOT_FOUND` |
-| `GET` | `/api/packages/{id}` | **领取**：**不重算**，直接返回封存的 `columns`/`rows`、图 ID `graph_id`、创建代次 `generation` 与放行代次 `release_generation`。**未放行**或**放行代次不等于当前代次**时返回 **409** `PACKAGE_NOT_RELEASED`（带 `release_generation`/`current_generation`），响应**不含任何样本**；已清除的包返回 **410** `PACKAGE_PURGED`；未知包 ID 返回 **404** `PACKAGE_NOT_FOUND` |
-| `POST` | `/api/packages/purge` | **按源列清除**：请求体 `{"columns": [{"source": "...", "column": "..."}, ...]}`（非空、组合互异）。按原内容来源与行影响规则（不受敏感标记限制）判断导出是否依赖任一指定列，清除依赖包保存的 `rows` 与放行记录并持久标记为已清除，返回本次清除的包 ID 列表（按 ID 排序，未匹配为空列表、**不留审计记录**）；有实际清除时在同一事务追加一条审计记录（当前 generation、请求源列、实际清除包 ID），详见下文“按源列清除已封存样本” |
+| `POST` | `/api/graphs/{id}/packages` | **封存**：请求体与按 ID 预演完全同构（只含 `rows`、`conditions`），沿当前图**最新版**、**当前名录**与全部原预演规则（覆盖、键集合、标量、200 行上限等）执行。仅当审查**安全**时把 `columns`、`rows`、**创建代次**与**封存时的图版本**存入 SQLite，返回 **201** 且响应体**只含包 `id`、绑定的 `graph_version` 与创建 `generation`**；输入错误（400 原错误码）或阻断（400 `PREVIEW_BLOCKED`，不含样本）都**不建包**；未知图 ID 返回 **404** `GRAPH_NOT_FOUND`。封存后图再改版**不会换绑** |
+| `POST` | `/api/packages/{id}/release` | **放行**：请求体 `{"expected_generation": N}`。`N` 与当前代次不符（过期）返回 **409** `GENERATION_CONFLICT`（带 `expected_generation`/`current_generation`），什么都不记；随后按**当前名录**重审包**绑定的历史图版本**（不是图的最新版），该历史版阻断时返回 **400** `RELEASE_BLOCKED`（带 `review`，不含样本）且**不放行**；成功则把**当前代次**保存为**放行代次**，响应体**只含包 `id` 与 `release_generation`**。名录变更后可再次放行（覆盖旧放行代次）；已清除的包返回 **410** `PACKAGE_PURGED`；未知包 ID 返回 **404** `PACKAGE_NOT_FOUND` |
+| `GET` | `/api/packages/{id}` | **领取**：**不重算**，直接返回封存的 `columns`/`rows`、图 ID `graph_id`、绑定的 **`graph_version`**、创建代次 `generation` 与放行代次 `release_generation`。**未放行**或**放行代次不等于当前代次**时返回 **409** `PACKAGE_NOT_RELEASED`（带 `release_generation`/`current_generation`），响应**不含任何样本**；已清除的包返回 **410** `PACKAGE_PURGED`；未知包 ID 返回 **404** `PACKAGE_NOT_FOUND` |
+| `POST` | `/api/packages/purge` | **按源列清除**：请求体 `{"columns": [{"source": "...", "column": "..."}, ...]}`（非空、组合互异）。对每个仍有效的包，按其**绑定的历史图版本**、依原内容来源与行影响规则（**不受敏感标记限制**）判断导出是否依赖任一指定列，清除依赖包保存的 `rows` 与放行记录并持久标记为已清除，返回本次清除的包 ID 列表（按 ID 排序，未匹配为空列表、**不留审计记录**）；有实际清除时在同一事务追加一条审计记录（当前 generation、请求源列、实际清除包 ID），详见下文“按源列清除已封存样本” |
 
 规则要点：
 
-* **封存即冻结**：包里的 `columns`/`rows` 在封存时物化并入库，之后名录、图结论如何变化都
-  不影响包内容；领取只是取出这份冻结数据。
+* **封存即冻结、即绑版**：包里的 `columns`/`rows` 在封存时物化并入库，图版本同时与样本绑定；
+  之后名录、图结论如何变化、图是否改版都不影响包内容与绑定版本；领取只是取出这份冻结数据。
+* **放行/清除看绑定的历史版**：放行按**当前名录**重审包绑定的历史图版本（最新版再安全也不
+  能代替被绑定的旧版）；按源列清除同样以绑定历史版的依赖为准。图改版本身**不改变任何包的
+  放行状态**，只有名录替换会推动代次闸门。
 * **代次闸门**：放行把**当前代次**盖在包上；领取只认“放行代次 == 当前代次”。名录每成功
   替换一次代次加一，旧放行立即失效——**即使名录改回安全（恢复），代次也已前进，仍须重新
   放行**才能领取。
@@ -1415,7 +1498,7 @@ PID=$(curl -s -X POST http://localhost:8080/api/graphs/$GID/packages \
   "conditions": {"only_cn": {"country": "CN"}}
 }' | python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
 echo "sealed package: $PID"
-# 响应体：{"id":"...","generation":0}
+# 响应体：{"id":"...","graph_version":1,"generation":0}
 ```
 
 ```bash
@@ -1430,7 +1513,7 @@ curl -s -X POST http://localhost:8080/api/packages/$PID/release \
 ```bash
 # 3) 领取：返回封存结果（不重算）、图 id、创建及放行代次
 curl -s http://localhost:8080/api/packages/$PID
-# {"id":"...","graph_id":"...","generation":0,"release_generation":0,
+# {"id":"...","graph_id":"...","graph_version":1,"generation":0,"release_generation":0,
 #  "columns":["user_id","mail","bucket"],"rows":[[1,"a@x.example","ALL"]]}
 ```
 
@@ -1474,7 +1557,7 @@ curl -s -X POST http://localhost:8080/api/packages/$PID/release \
 # {"id":"...","release_generation":2}
 
 curl -s http://localhost:8080/api/packages/$PID
-# {"id":"...","graph_id":"...","generation":0,"release_generation":2,
+# {"id":"...","graph_id":"...","graph_version":1,"generation":0,"release_generation":2,
 #  "columns":["user_id","mail","bucket"],"rows":[[1,"a@x.example","ALL"]]}
 ```
 
@@ -1521,6 +1604,116 @@ curl -s -X PUT http://localhost:8080/api/sensitive-columns \
   -d '{"entries": [], "expected_generation": 3}'
 ```
 
+### curl 走一遍：新版安全，而旧包仍阻断；按旧来源清除只清旧包
+
+封存包**绑定封存时的图版本**：图改版后，最新版可以在当前名录下安全封存、放行，而绑定旧版
+的包依旧被旧依赖阻断；按源列清除也只按各包绑定的历史版判定。下例从头走一遍。
+
+```bash
+# 1) 登记版本 1：导出列 mail 复制 users.email
+GID=$(curl -s -X POST http://localhost:8080/api/graphs \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "nodes": [
+    {"id": "users", "type": "source", "columns": [
+      {"name": "uid", "sensitive": false},
+      {"name": "email", "sensitive": false},
+      {"name": "country", "sensitive": false}]},
+    {"id": "only_cn", "type": "filter", "input": "users",
+     "references": ["country"]},
+    {"id": "export_users", "type": "projection", "input": "only_cn",
+     "columns": [
+       {"name": "user_id", "copy": "uid"},
+       {"name": "mail", "copy": "email"},
+       {"name": "bucket", "constant": "ALL"}]}
+  ],
+  "export": "export_users"
+}' | python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
+
+# 2) 在版本 1 上封存并放行（创建代次 0，绑定 graph_version 1）
+OLD=$(curl -s -X POST http://localhost:8080/api/graphs/$GID/packages \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "rows": {"users": [
+    {"uid": 1, "email": "a@x.example", "country": "CN"},
+    {"uid": 2, "email": "b@x.example", "country": "US"}]},
+  "conditions": {"only_cn": {"country": "CN"}}
+}' | python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
+# {"id":"<OLD>","graph_version":1,"generation":0}
+curl -s -X POST http://localhost:8080/api/packages/$OLD/release \
+  -H 'Content-Type: application/json' -d '{"expected_generation": 0}'
+# {"id":"<OLD>","release_generation":0}
+
+# 3) 名录把 users.email 标为敏感列（代次 0 -> 1）：绑定版本 1 的旧包放行被拒
+curl -s -X PUT http://localhost:8080/api/sensitive-columns \
+  -H 'Content-Type: application/json' \
+  -d '{"entries": [{"source": "users", "column": "email"}],
+       "expected_generation": 0}' >/dev/null
+curl -s -i -X POST http://localhost:8080/api/packages/$OLD/release \
+  -H 'Content-Type: application/json' -d '{"expected_generation": 1}'
+# HTTP/1.1 400 ... {"error":{"code":"RELEASE_BLOCKED",
+#   "review":{... mail 的 content_reasons 为
+#   [{"node_id":"users","column":"email"}] ...}}}  —— 不含样本
+
+# 4) 在原 ID 下提交版本 2：删掉 mail 列，不再依赖 users.email；expected_version=1
+curl -s -X PUT http://localhost:8080/api/graphs/$GID \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "expected_version": 1,
+  "nodes": [
+    {"id": "users", "type": "source", "columns": [
+      {"name": "uid", "sensitive": false},
+      {"name": "email", "sensitive": false},
+      {"name": "country", "sensitive": false}]},
+    {"id": "only_cn", "type": "filter", "input": "users",
+     "references": ["country"]},
+    {"id": "export_users", "type": "projection", "input": "only_cn",
+     "columns": [
+       {"name": "user_id", "copy": "uid"},
+       {"name": "bucket", "constant": "ALL"}]}
+  ],
+  "export": "export_users"
+}'
+# {"id":"<GID>","graph_version":2,"generation":1,
+#  "review":{"blocked":false,...}}      —— 名录仍为代次 1，generation 未被改版推进
+
+# 5) 读取/预演此后都用最新版（版本 2 在当前名录下安全）
+curl -s http://localhost:8080/api/graphs/$GID
+# {"...nodes":[...版本2...],"graph_version":2,"generation":1,"review":{...}}
+
+# 6) 按版本 2 封存新包：成功，绑定 graph_version 2；代次 1 下放行成功
+NEW=$(curl -s -X POST http://localhost:8080/api/graphs/$GID/packages \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "rows": {"users": [
+    {"uid": 1, "email": "a@x.example", "country": "CN"},
+    {"uid": 2, "email": "b@x.example", "country": "US"}]},
+  "conditions": {"only_cn": {"country": "CN"}}
+}' | python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
+# {"id":"<NEW>","graph_version":2,"generation":1}
+curl -s -X POST http://localhost:8080/api/packages/$NEW/release \
+  -H 'Content-Type: application/json' -d '{"expected_generation": 1}'
+# {"id":"<NEW>","release_generation":1}
+curl -s http://localhost:8080/api/packages/$NEW
+# {"id":"<NEW>","graph_id":"<GID>","graph_version":2,"generation":1,
+#  "release_generation":1,"columns":["user_id","bucket"],"rows":[[1,"ALL"]]}
+
+# 7) 旧包绑定的仍是版本 1：图最新版安全也不替它，放行依旧 400
+curl -s -i -X POST http://localhost:8080/api/packages/$OLD/release \
+  -H 'Content-Type: application/json' -d '{"expected_generation": 1}'
+# HTTP/1.1 400 ... {"error":{"code":"RELEASE_BLOCKED",...}}
+
+# 8) 按旧来源 users/email 清除：只有绑定版本 1 的旧包命中；版本 2 的新包不动
+curl -s -X POST http://localhost:8080/api/packages/purge \
+  -H 'Content-Type: application/json' \
+  -d '{"columns": [{"source": "users", "column": "email"}]}'
+# {"purged":["<OLD>"]}
+curl -s -i http://localhost:8080/api/packages/$OLD
+# HTTP/1.1 410 ... {"error":{"code":"PACKAGE_PURGED",...}}
+curl -s http://localhost:8080/api/packages/$NEW
+# {"id":"<NEW>","graph_version":2,"release_generation":1,"rows":[[1,"ALL"]],...}
+```
+
 ## 按源列清除已封存样本：POST /api/packages/purge
 
 按**源列**清除已封存的样本。请求体：
@@ -1537,10 +1730,11 @@ curl -s -X PUT http://localhost:8080/api/sensitive-columns \
 组合**互异**。空列表、缺字段、空字符串、重复组合、未知字段等 schema 问题返回 HTTP 422。
 来源可以指向任何源与列——未匹配任何已封存样本时返回空列表，不报错、也不改动任何数据。
 
-### 依赖判定：按原内容来源与行影响规则，不受敏感标记限制
+### 依赖判定：按绑定的历史图版本与原内容/行影响规则，不受敏感标记限制
 
-一张登记图的导出是否**依赖**某指定列，完全按原内容来源与行影响规则判断；图内
-`sensitive` 标记与共用名录**都不参与**这一判定：
+对每个包，判定都在它**封存时绑定的图版本**上进行（图改版后最新版是否还依赖该列与旧包
+无关）；导出是否**依赖**某指定列，完全按原内容来源与行影响规则判断，图内 `sensitive`
+标记与共用名录**都不参与**这一判定：
 
 * `copy` 把上游列的依赖带入输出列；`constant` 只切断**内容来源**；
 * 筛选 `references` 与连接键留下的**行影响**仍算依赖（常量替换无法消除行影响）；
@@ -1548,8 +1742,9 @@ curl -s -X PUT http://localhost:8080/api/sensitive-columns \
 
 ### 清除规则
 
-* 导出依赖任一指定列时，该图**此次操作生效前已存在**的全部未清除包都被清除：SQLite 中
-  保存的 `rows` 与放行记录被删除，包被**持久标记为已清除**；**后续新封存的包不受影响**。
+* 导出依赖任一指定列时，绑定该历史版的**此次操作生效前已存在**的全部未清除包都被清除：SQLite
+  中保存的 `rows` 与放行记录被删除，包被**持久标记为已清除**；**后续新封存的包不受影响**。
+  图改版后按最新版封存的新包不再依赖旧列时，清除旧列不会波及它。
 * 图、敏感名录与 generation 一律不变；其他包与旧接口行为不变。
 * 有实际清除时，清除与一条**审计记录**（当前 generation、按 `(source, column)` 排序的请求源列、
   按 ID 排序的实际清除包 ID）在**同一事务**中提交；任何写入或提交失败都整批不变（500
@@ -1568,7 +1763,7 @@ curl -s -X PUT http://localhost:8080/api/sensitive-columns \
 ### 已清除包：放行与领取均返回 410
 
 已清除是**终态**：`POST /api/packages/{id}/release` 与 `GET /api/packages/{id}` 都返回
-**410** `PACKAGE_PURGED`，响应不含任何样本；名录恢复安全、按当前代次重新放行或重启都
+**410** `PACKAGE_PURGED`，响应不含任何样本；名录恢复安全、图改版、按当前代次重新放行或重启都
 **不能**恢复（放行记录已随清除删除）。未知包 ID 仍为 404 `PACKAGE_NOT_FOUND`。
 
 ### curl 走一遍：封存 → 放行 → 按源列清除 → 拒领
@@ -1768,13 +1963,13 @@ python -m pytest tests/ -q
 ## 文件说明
 
 ```
-app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest、PreviewRequest、CompareRequest，以及 GraphRegisterRequest、GraphPreviewRequest、SensitiveColumnsReplaceRequest、PackageReleaseRequest、PackagePurgeRequest）
+app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest、RenameRequest、ComposeRequest、PreviewRequest、CompareRequest，以及 GraphRegisterRequest、GraphRevisionRequest、GraphPreviewRequest、SensitiveColumnsReplaceRequest、PackageReleaseRequest、PackagePurgeRequest）
 app/engine.py     图校验、拓扑排序、来源传播（图内标记 ∪ 名录的 OR 敏感集）、逐列审查、安全修订、按列精简、源列批量改名、上下游拼接、小样本预演、两版导出风险对照，以及不受敏感标记限制的导出源列依赖判定
-app/registry.py   登记图/按图预演/名录读取与整份替换，导出包封存/放行/领取，按源列清除已封存样本，以及审计日志翻页读取：锁内取快照、重审全部登记图、世代冲突、固定截止游标
-app/storage.py    SQLite 持久化（名录与 generation、登记图原图与审查结论、导出包与放行代次及已清除标记、两类操作共用 seq 的审计日志；替换/清除与其审计行在同一显式事务提交，写入/提交失败整体回滚；旧库打开时建空审计表）
-app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/api/compare、/api/graphs、/api/graphs/{id}、/api/graphs/{id}/preview、/api/graphs/{id}/packages、/api/packages/{id}/release、/api/packages/{id}、/api/packages/purge、/api/sensitive-columns、/api/audit-log、/health）
-examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、preview_request.json、compare_request.json）
-tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演、两版对照，登记图/名录/代次/并发次序/替换失败回滚/SQLite 持久化，导出包封存/放行/领取/失败不留痕，按源列清除已封存样本，以及名录替换/样本清除审计日志的记录内容、翻页、固定截止、重启保留、旧库空日志与同事务回滚测试
+app/registry.py   登记图/原 ID 改版（graph_version 乐观锁）/按图预演/名录读取与整份替换，导出包封存（绑定封存图版本）/放行（重审绑定历史版）/领取，按绑定历史版的源列清除已封存样本，以及审计日志翻页读取：锁内取快照、重审全部登记图最新版、世代/版本冲突、固定截止游标
+app/storage.py    SQLite 持久化（名录与 generation、登记图最新版与全部历史版本、导出包与绑定图版本/放行代次/已清除标记、两类操作共用 seq 的审计日志；改版追加与当前版指针、替换/清除与其审计行均在同一显式事务提交，写入/提交失败整体回滚；旧库打开时迁移为版本 1 并建空审计表）
+app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/api/compose、/api/preview、/api/compare、/api/graphs、/api/graphs/{id}（GET 读最新版、PUT 提交新版）、/api/graphs/{id}/preview、/api/graphs/{id}/packages、/api/packages/{id}/release、/api/packages/{id}、/api/packages/purge、/api/sensitive-columns、/api/audit-log、/health）
+examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json、compose_request.json、preview_request.json、compare_request.json、graph_version_request.json）
+tests/            传播规则、拒绝场景、修订/复审、精简、改名、拼接、预演、两版对照，登记图/名录/代次/并发次序/替换失败回滚/SQLite 持久化，图版本改版/版本冲突/阻断图保存/封存包绑版/绑定历史版放行与按旧来源清除/旧库迁移版本 1，导出包封存/放行/领取/失败不留痕，按源列清除已封存样本，以及名录替换/样本清除审计日志的记录内容、翻页、固定截止、重启保留、旧库空日志与同事务回滚测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排（命名卷 export-risk-data 持久化 /data/export-risk.db）
 ```
