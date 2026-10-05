@@ -5,15 +5,20 @@ Three pieces of state survive restarts:
 * the shared sensitive-column registry (entries keyed by ``(source, column)``)
   together with its monotonically increasing ``generation`` (0 on a fresh
   database, incremented once per successful whole-list replacement);
-* every registered graph: its original ``nodes``/``export`` submission and the
-  review result produced under the registry generation the graph was last
-  reviewed at;
-* every sealed export package: the graph it was sealed from, the sample
-  ``columns``/``rows`` frozen at seal time, the registry ``generation`` the
-  package was created under, and — once released — the ``release_generation``
-  the package was released under (NULL while unreleased). A package purged
-  by source column keeps its id but loses its ``rows`` and release record
-  and carries a persistent ``purged`` marker;
+* every registered graph and the full history of its submitted versions:
+  ``graphs`` holds each graph's *latest* version (its original
+  ``nodes``/``export`` submission, the monotonically increasing ``version``
+  counter and the review result produced under the registry generation the
+  latest version was last reviewed at), while ``graph_versions`` keeps the
+  original ``nodes``/``export`` of *every* version (1-based) ever committed —
+  superseded versions stay bound to the packages sealed against them;
+* every sealed export package: the graph it was sealed from together with the
+  ``graph_version`` it binds (the graph's latest version at seal time), the
+  sample ``columns``/``rows`` frozen at seal time, the registry ``generation``
+  the package was created under, and — once released — the
+  ``release_generation`` the package was released under (NULL while
+  unreleased). A package purged by source column keeps its id but loses its
+  ``rows`` and release record and carries a persistent ``purged`` marker;
 * the append-only audit log of committed registry replacements and sample
   purges: each entry carries the effect-order ``seq`` shared by both kinds,
   its ``type`` and a payload describing the change (never the samples
@@ -26,12 +31,14 @@ replacement persists the new entries, the new generation, every graph's new
 review result and its audit-log row in a single explicit SQLite transaction:
 either the whole change commits or nothing at all changes, so a registry can
 never be observed together with stale conclusions — not even after a write or
-commit failure, and not after the database is reopened. Sealing a package and
-recording its release are likewise single atomic writes: a failed write or
-commit never leaves a new package or a new release record behind. A purge
-commits its package updates together with its audit-log row the same way.
-A database written by an older release simply starts with an empty log: the
-audit table is created on open and nothing is backfilled.
+commit failure, and not after the database is reopened. Registering a graph,
+committing a new graph version, sealing a package and recording its release
+are likewise single atomic writes: a failed write or commit never leaves a new
+graph/version/package or a new release record behind. A purge commits its
+package updates together with its audit-log row the same way. A database
+written by an older release is migrated on open: the version columns are
+attached, its single graph snapshot is backfilled as version 1 into
+``graph_versions`` and every existing package binds that version.
 """
 
 from __future__ import annotations
@@ -61,15 +68,24 @@ CREATE TABLE IF NOT EXISTS sensitive_entries (
 CREATE TABLE IF NOT EXISTS graphs (
     id TEXT PRIMARY KEY,
     ordinal INTEGER NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
     nodes TEXT NOT NULL,
     export TEXT NOT NULL,
     review TEXT NOT NULL,
     review_generation INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS graph_versions (
+    graph_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    nodes TEXT NOT NULL,
+    export TEXT NOT NULL,
+    PRIMARY KEY (graph_id, version)
+);
 CREATE TABLE IF NOT EXISTS packages (
     id TEXT PRIMARY KEY,
     ordinal INTEGER NOT NULL,
     graph_id TEXT NOT NULL,
+    graph_version INTEGER NOT NULL DEFAULT 1,
     columns TEXT NOT NULL,
     rows TEXT NOT NULL,
     generation INTEGER NOT NULL,
@@ -112,15 +128,38 @@ class Store:
         ``ALTER TABLE`` when missing, so an existing database (the Compose
         named volume survives image updates) keeps working unchanged.
         """
+        graph_columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(graphs)")
+        }
+        if "version" not in graph_columns:
+            self._conn.execute(
+                "ALTER TABLE graphs ADD COLUMN version INTEGER NOT NULL DEFAULT 1"
+            )
+
         package_columns = {
             row["name"]
             for row in self._conn.execute("PRAGMA table_info(packages)")
         }
+        if "graph_version" not in package_columns:
+            self._conn.execute(
+                "ALTER TABLE packages ADD COLUMN graph_version "
+                "INTEGER NOT NULL DEFAULT 1"
+            )
         if "purged" not in package_columns:
             self._conn.execute(
                 "ALTER TABLE packages ADD COLUMN purged "
                 "INTEGER NOT NULL DEFAULT 0"
             )
+
+        # Graphs from before versioning only ever had one stored snapshot;
+        # backfill it as version 1 (matching every migrated package's binding)
+        # so a reopened old database behaves like one whose graphs and
+        # packages were all at version 1.
+        self._conn.execute(
+            "INSERT OR IGNORE INTO graph_versions (graph_id, version, nodes, export) "
+            "SELECT id, 1, nodes, export FROM graphs g WHERE NOT EXISTS ("
+            "SELECT 1 FROM graph_versions v WHERE v.graph_id = g.id AND v.version = 1)"
+        )
 
     def close(self) -> None:
         with self.lock:
@@ -226,15 +265,25 @@ class Store:
 
     def list_graph_rows(self) -> list[sqlite3.Row]:
         return self._conn.execute(
-            "SELECT id, nodes, export, review, review_generation "
+            "SELECT id, version, nodes, export, review, review_generation "
             "FROM graphs ORDER BY ordinal"
         ).fetchall()
 
     def get_graph_row(self, graph_id: str) -> Optional[sqlite3.Row]:
         return self._conn.execute(
-            "SELECT id, nodes, export, review, review_generation "
+            "SELECT id, version, nodes, export, review, review_generation "
             "FROM graphs WHERE id = ?",
             (graph_id,),
+        ).fetchone()
+
+    def get_graph_version_row(
+        self, graph_id: str, version: int
+    ) -> Optional[sqlite3.Row]:
+        """Return one committed graph version's original submission."""
+        return self._conn.execute(
+            "SELECT graph_id, version, nodes, export FROM graph_versions "
+            "WHERE graph_id = ? AND version = ?",
+            (graph_id, version),
         ).fetchone()
 
     def insert_graph(
@@ -245,35 +294,76 @@ class Store:
         review: dict[str, object],
         generation: int,
     ) -> None:
+        """Persist a freshly registered graph at version 1 atomically.
+
+        The latest-version pointer in ``graphs`` and the version-1 history row
+        in ``graph_versions`` commit as one unit: a failed write or commit
+        leaves neither behind, so a failed registration is observable as no
+        graph at all.
+        """
         next_ordinal = self._conn.execute(
             "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM graphs"
         ).fetchone()[0]
-        with self._conn:
+        nodes_json = json.dumps(nodes, ensure_ascii=False)
+        review_json = json.dumps(review, ensure_ascii=False)
+        with self._transaction():
             self._conn.execute(
                 "INSERT INTO graphs "
-                "(id, ordinal, nodes, export, review, review_generation) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    graph_id,
-                    next_ordinal,
-                    json.dumps(nodes, ensure_ascii=False),
-                    export,
-                    json.dumps(review, ensure_ascii=False),
-                    generation,
-                ),
+                "(id, ordinal, version, nodes, export, review, review_generation) "
+                "VALUES (?, ?, 1, ?, ?, ?, ?)",
+                (graph_id, next_ordinal, nodes_json, export,
+                 review_json, generation),
+            )
+            self._conn.execute(
+                "INSERT INTO graph_versions (graph_id, version, nodes, export) "
+                "VALUES (?, 1, ?, ?)",
+                (graph_id, nodes_json, export),
+            )
+
+    def replace_graph(
+        self,
+        graph_id: str,
+        version: int,
+        nodes: list[dict[str, object]],
+        export: str,
+        review: dict[str, object],
+        generation: int,
+    ) -> None:
+        """Commit one new graph version atomically.
+
+        ``version`` is the new (already incremented) version. The latest
+        pointer in ``graphs`` — nodes/export, version and the review
+        conclusion (its generation unchanged by the revision itself) — and the
+        new ``graph_versions`` history row commit together: a failed write or
+        commit leaves the previous version exactly as it was, including after
+        the database is reopened.
+        """
+        nodes_json = json.dumps(nodes, ensure_ascii=False)
+        review_json = json.dumps(review, ensure_ascii=False)
+        with self._transaction():
+            self._conn.execute(
+                "UPDATE graphs SET version = ?, nodes = ?, export = ?, "
+                "review = ?, review_generation = ? WHERE id = ?",
+                (version, nodes_json, export, review_json,
+                 generation, graph_id),
+            )
+            self._conn.execute(
+                "INSERT INTO graph_versions (graph_id, version, nodes, export) "
+                "VALUES (?, ?, ?, ?)",
+                (graph_id, version, nodes_json, export),
             )
 
     # ----------------------------------------------------------- packages --
 
     def list_package_rows(self) -> list[sqlite3.Row]:
         return self._conn.execute(
-            "SELECT id, graph_id, columns, rows, generation, "
+            "SELECT id, graph_id, graph_version, columns, rows, generation, "
             "release_generation, purged FROM packages ORDER BY ordinal"
         ).fetchall()
 
     def get_package_row(self, package_id: str) -> Optional[sqlite3.Row]:
         return self._conn.execute(
-            "SELECT id, graph_id, columns, rows, generation, "
+            "SELECT id, graph_id, graph_version, columns, rows, generation, "
             "release_generation, purged FROM packages WHERE id = ?",
             (package_id,),
         ).fetchone()
@@ -282,14 +372,18 @@ class Store:
         self,
         package_id: str,
         graph_id: str,
+        graph_version: int,
         columns: list[str],
         rows: list[list[object]],
         generation: int,
     ) -> None:
         """Persist a freshly sealed (still unreleased) package atomically.
 
-        A failed write or commit rolls the insert back: no half-written
-        package is ever left behind.
+        The package binds ``graph_version`` — the graph's latest version at
+        seal time — together with the frozen sample, so release, claim and
+        purge always address the graph as it was when sealed. A failed write
+        or commit rolls the insert back: no half-written package is ever left
+        behind.
         """
         next_ordinal = self._conn.execute(
             "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM packages"
@@ -297,12 +391,13 @@ class Store:
         with self._conn:
             self._conn.execute(
                 "INSERT INTO packages "
-                "(id, ordinal, graph_id, columns, rows, generation, "
-                " release_generation) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                "(id, ordinal, graph_id, graph_version, columns, rows, "
+                " generation, release_generation) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
                 (
                     package_id,
                     next_ordinal,
                     graph_id,
+                    graph_version,
                     json.dumps(columns, ensure_ascii=False),
                     json.dumps(rows, ensure_ascii=False),
                     generation,

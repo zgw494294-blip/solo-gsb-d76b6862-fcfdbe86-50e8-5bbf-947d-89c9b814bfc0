@@ -1,16 +1,29 @@
 """Registered-graph and shared-registry operations on top of the engine.
 
 Every operation here runs under the store's single lock, so registration,
-reads, registered previews, package sealing/releasing/claiming/purging and
-registry replacements take effect in one observable total order. Within that
-order each decision uses the *same* generation for the registry, the stored
-review conclusions and the review a preview is gated on: a preview either
-precedes a replacement (old registry plus old conclusion) or follows it (new
-registry plus freshly computed, newly stored conclusion), never a mixture of
-the two. Likewise a package is sealed, released, claimed or purged either
-fully before or fully after a replacement — a release can never be recorded
-under a stale generation, and a claim can never serve data whose release
-generation the registry has already moved past.
+version replacement, reads, registered previews, package
+sealing/releasing/claiming/purging and registry replacements take effect in
+one observable total order. Within that order each decision uses the *same*
+generation for the registry, the stored review conclusions and the review a
+preview is gated on: a preview either precedes a replacement (old registry
+plus old conclusion) or follows it (new registry plus freshly computed, newly
+stored conclusion), never a mixture of the two. Likewise a package is sealed,
+released, claimed or purged either fully before or fully after a replacement
+— a release can never be recorded under a stale generation, and a claim can
+never serve data whose release generation the registry has already moved
+past.
+
+Registered graphs are versioned: a new submission under an existing id
+advances its ``graph_version`` (optimistically gated on
+``expected_version``) without changing the registry generation, any sealed
+package or any release record. Reads and by-id previews always address the
+*latest* version, while every package binds the version that was latest when
+it was sealed: release reviews that *bound* version under the *current*
+registry, claim serves the bound version's frozen sample, and purge judges
+the dependency closure on the bound version (the original content/row rules,
+sensitivity marks ignored). A revision, a seal and a registry replacement
+therefore serialize in the same total order and each decision can be traced
+to one fixed (graph version, registry generation) pair.
 """
 
 from __future__ import annotations
@@ -28,6 +41,22 @@ from .storage import get_store
 
 class GraphNotFound(Exception):
     """No registered graph carries the given id (HTTP 404)."""
+
+    def __init__(self, graph_id: str):
+        super().__init__(f"no registered graph with id '{graph_id}'")
+        self.graph_id = graph_id
+
+
+class StaleVersion(Exception):
+    """A new version's expected version is outdated (HTTP 409)."""
+
+    def __init__(self, expected: int, current: int):
+        super().__init__(
+            f"expected graph version {expected} does not match the current "
+            f"version {current}"
+        )
+        self.expected = expected
+        self.current = current
 
 
 class PackageNotFound(Exception):
@@ -104,7 +133,8 @@ def register_graph(
     The graph must pass exactly the same whole-graph validation as
     ``/api/review`` (an invalid graph is rejected, nothing is registered). Its
     sensitivity is the OR of the in-graph ``sensitive`` flags and the current
-    shared registry. The original submitted ``nodes`` are stored verbatim.
+    shared registry. The original submitted ``nodes`` are stored verbatim at
+    version 1 (both as the latest pointer and in the version history).
     """
     # Parse/validate before taking the lock so model-level errors behave as on
     # the other endpoints; the engine re-validates under the registry snapshot.
@@ -121,6 +151,7 @@ def register_graph(
         db.insert_graph(graph_id, nodes, export, review_result, generation)
         return {
             "id": graph_id,
+            "graph_version": 1,
             "nodes": nodes,
             "export": export,
             "generation": generation,
@@ -128,8 +159,68 @@ def register_graph(
         }
 
 
+def replace_graph(
+    graph_id: str,
+    expected_version: int,
+    nodes: list[dict[str, object]],
+    export: str,
+) -> dict[str, object]:
+    """Commit a new version of a registered graph under its existing id.
+
+    As at first registration the submission must pass the whole-graph
+    validation (an invalid graph is rejected and the previous version stays
+    in place) and is reviewed under the *current* registry; a blocked new
+    version is stored just the same. ``expected_version`` must equal the
+    graph's current version, otherwise :class:`StaleVersion` (HTTP 409) is
+    raised before anything is written; an unknown id raises
+    :class:`GraphNotFound` (HTTP 404). On success the version advances by one
+    and the new submission becomes the latest version that reads and by-id
+    previews address, while the registry generation, sealed package samples
+    and release records are untouched. The graph-version pointer and the new
+    history row commit in one transaction, so a failed write or commit leaves
+    the old version exactly as it was.
+    """
+    # Parse/validate before taking the lock so model-level errors behave as on
+    # registration; the engine re-validates under the registry snapshot.
+    ReviewRequest.model_validate({"nodes": nodes, "export": export})
+
+    db = get_store()
+    with db.lock:
+        row = db.get_graph_row(graph_id)
+        if row is None:
+            raise GraphNotFound(graph_id)
+        current_version = row["version"]
+        if expected_version != current_version:
+            raise StaleVersion(expected_version, current_version)
+        extra_sensitive, generation = _registry_snapshot()
+        request = ReviewRequest.model_validate(
+            {"nodes": nodes, "export": export}
+        )
+        review_result = run_review(request, extra_sensitive)
+        next_version = current_version + 1
+        db.replace_graph(
+            graph_id, next_version, nodes, export, review_result, generation
+        )
+        return {
+            "id": graph_id,
+            "graph_version": next_version,
+            "generation": generation,
+            "review": review_result,
+        }
+
+
+def _bound_graph(
+    db, graph_id: str, version: int
+) -> tuple[list[object], str]:
+    """Load one bound graph version's original submission as parsed nodes."""
+    version_row = db.get_graph_version_row(graph_id, version)
+    if version_row is None:  # pragma: no cover - packages always bind a stored version
+        raise GraphNotFound(graph_id)
+    return _loads(version_row["nodes"]), version_row["export"]
+
+
 def read_graph(graph_id: str) -> dict[str, object]:
-    """Return the original submission plus the current generation and review."""
+    """Return the latest version plus the current generation and review."""
     db = get_store()
     with db.lock:
         row = db.get_graph_row(graph_id)
@@ -137,6 +228,7 @@ def read_graph(graph_id: str) -> dict[str, object]:
             raise GraphNotFound(graph_id)
         return {
             "id": row["id"],
+            "graph_version": row["version"],
             "nodes": _loads(row["nodes"]),
             "export": row["export"],
             "generation": row["review_generation"],
@@ -193,9 +285,11 @@ def seal_package(
     :func:`preview_graph` apply: any input error (coverage, key sets,
     scalars, row limits) or a blocked export rejects the request *before*
     anything is stored, so a failed seal never leaves a package behind. Only
-    when the export passes review are the materialized ``columns``/``rows``
-    and the current registry generation persisted; the response carries just
-    the new package id and that creation generation.
+    when the export passes review are the materialized ``columns``/``rows``,
+    the graph's current ``graph_version`` (the version the package binds from
+    then on) and the current registry generation persisted; the response
+    carries the new package id, the bound graph version and that creation
+    generation.
     """
     db = get_store()
     with db.lock:
@@ -213,14 +307,20 @@ def seal_package(
         )
         result = run_preview(request, extra_sensitive)
         package_id = uuid.uuid4().hex
+        graph_version = row["version"]
         db.insert_package(
             package_id,
             graph_id,
+            graph_version,
             result["columns"],
             result["rows"],
             generation,
         )
-        return {"id": package_id, "generation": generation}
+        return {
+            "id": package_id,
+            "graph_version": graph_version,
+            "generation": generation,
+        }
 
 
 def release_package(
@@ -230,13 +330,14 @@ def release_package(
 
     ``expected_generation`` must equal the current registry generation; a
     stale value is rejected as :class:`StaleGeneration` (HTTP 409) without
-    recording anything. The graph the package was sealed from is re-reviewed
-    under the current registry snapshot: when it is blocked the release is
-    rejected (HTTP 400) and nothing is recorded. On success the current
-    generation is stored as the package's release generation and only the
-    package id and that generation are returned. Re-releasing after a
-    registry change overwrites the previous release generation. A purged
-    package can never be released again (:class:`PackagePurged`, HTTP 410).
+    recording anything. The *bound historical graph version* the package was
+    sealed from is re-reviewed under the current registry snapshot (a later
+    revision of the graph cannot change the package): when it is blocked the
+    release is rejected (HTTP 400) and nothing is recorded. On success the
+    current generation is stored as the package's release generation and only
+    the package id and that generation are returned. Re-releasing after a registry change overwrites the previous release
+    generation. A purged package can never be released again
+    (:class:`PackagePurged`, HTTP 410).
     """
     db = get_store()
     with db.lock:
@@ -248,21 +349,21 @@ def release_package(
         extra_sensitive, generation = _registry_snapshot()
         if expected_generation != generation:
             raise StaleGeneration(expected_generation, generation)
-        graph_row = db.get_graph_row(row["graph_id"])
-        if graph_row is None:  # pragma: no cover - graphs are never deleted
-            raise GraphNotFound(row["graph_id"])
+        bound_nodes, bound_export = _bound_graph(
+            db, row["graph_id"], row["graph_version"]
+        )
         review_result = run_review(
             ReviewRequest.model_validate(
-                {"nodes": _loads(graph_row["nodes"]), "export": graph_row["export"]}
+                {"nodes": bound_nodes, "export": bound_export}
             ),
             extra_sensitive,
         )
         if review_result["blocked"]:
             raise ValidationError(
                 "RELEASE_BLOCKED",
-                "the graph is blocked under the current registry; the "
-                "package is not released",
-                graph_row["export"],
+                "the bound graph version is blocked under the current "
+                "registry; the package is not released",
+                bound_export,
                 {"review": review_result},
             )
         db.release_package(package_id, generation)
@@ -273,12 +374,13 @@ def claim_package(package_id: str) -> dict[str, object]:
     """Hand out a sealed package's frozen sample data.
 
     Nothing is recomputed: the stored ``columns``/``rows`` are returned
-    together with the graph id, the creation generation and the release
-    generation. A package that was never released, or whose release
-    generation no longer equals the current registry generation (the
-    registry moved on — even back to a safe list), is rejected as
-    :class:`PackageNotReleased` (HTTP 409) without any sample data. A purged
-    package is rejected as :class:`PackagePurged` (HTTP 410) forever.
+    together with the graph id, the bound graph version, the creation
+    generation and the release generation. A package that was never
+    released, or whose release generation no longer equals the current
+    registry generation (the registry moved on — even back to a safe list),
+    is rejected as :class:`PackageNotReleased` (HTTP 409) without any sample
+    data. A purged package is rejected as :class:`PackagePurged` (HTTP 410)
+    forever.
     """
     db = get_store()
     with db.lock:
@@ -294,6 +396,7 @@ def claim_package(package_id: str) -> dict[str, object]:
         return {
             "id": row["id"],
             "graph_id": row["graph_id"],
+            "graph_version": row["graph_version"],
             "generation": row["generation"],
             "release_generation": release_generation,
             "columns": _loads(row["columns"]),
@@ -320,10 +423,12 @@ def purge_packages(columns: list[tuple[str, str]]) -> dict[str, object]:
     row-influence rules with sensitivity marks ignored entirely (neither
     in-graph ``sensitive`` flags nor the shared registry play a role): a
     package is purged when any listed ``(source, column)`` pair reaches its
-    graph's export — through copied content, or as row-level influence left
-    by a filter reference or a join key, which a constant replacement cannot
-    cut. Only the export's dependency closure counts; side branches never
-    contribute.
+    *bound graph version's* export — through copied content, or as row-level
+    influence left by a filter reference or a join key, which a constant
+    replacement cannot cut. The decision always uses the graph version that
+    was latest when the package was sealed (a later revision cannot purge or
+    spare a sealed package). Only the export's dependency closure counts;
+    side branches never contribute.
 
     Only packages that already exist when this operation takes effect are
     considered; packages sealed afterwards are unaffected. Packages already
@@ -339,20 +444,20 @@ def purge_packages(columns: list[tuple[str, str]]) -> dict[str, object]:
     db = get_store()
     targets = frozenset(columns)
     with db.lock:
-        # Snapshot the still-live packages grouped by graph; already purged
-        # packages are never cleared (or listed) a second time.
-        live_by_graph: dict[str, list[str]] = {}
+        # Snapshot the still-live packages grouped by their *bound* graph
+        # version; already purged packages are never cleared (or listed) a
+        # second time.
+        live_by_bound_graph: dict[tuple[str, int], list[str]] = {}
         for row in db.list_package_rows():
             if not row["purged"]:
-                live_by_graph.setdefault(row["graph_id"], []).append(row["id"])
+                key = (row["graph_id"], row["graph_version"])
+                live_by_bound_graph.setdefault(key, []).append(row["id"])
 
         purged: list[str] = []
-        for graph_id, package_ids in live_by_graph.items():
-            graph_row = db.get_graph_row(graph_id)
-            if graph_row is None:  # pragma: no cover - packages always reference a registered graph
-                continue
+        for (graph_id, graph_version), package_ids in live_by_bound_graph.items():
+            bound_nodes, bound_export = _bound_graph(db, graph_id, graph_version)
             request = ReviewRequest.model_validate(
-                {"nodes": _loads(graph_row["nodes"]), "export": graph_row["export"]}
+                {"nodes": bound_nodes, "export": bound_export}
             )
             if export_dependencies(request) & targets:
                 purged.extend(package_ids)

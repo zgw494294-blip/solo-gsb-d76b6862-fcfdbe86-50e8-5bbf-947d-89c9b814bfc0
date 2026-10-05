@@ -91,13 +91,14 @@ def put_registry(entries, generation):
 # -------------------------------- sealing -----------------------------------
 
 
-def test_seal_returns_only_package_id_and_creation_generation():
+def test_seal_returns_only_package_id_creation_generation_and_graph_version():
     gid = register()
     resp = seal(gid)
     assert resp.status_code == 201
     body = resp.json()
-    assert set(body) == {"id", "generation"}
+    assert set(body) == {"id", "graph_version", "generation"}
     assert isinstance(body["id"], str) and body["id"]
+    assert body["graph_version"] == 1
     assert body["generation"] == 0
 
 
@@ -229,6 +230,7 @@ def test_claim_returns_sealed_data_with_both_generations():
     assert resp.json() == {
         "id": pid,
         "graph_id": gid,
+        "graph_version": 1,
         "generation": 0,
         "release_generation": 0,
         "columns": SEALED_COLUMNS,

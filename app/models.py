@@ -267,8 +267,24 @@ class GraphRegisterRequest(ReviewRequest):
 
     The shape is identical to :class:`ReviewRequest` (``nodes`` + ``export``)
     and the whole graph is validated by exactly the same rules at registration
-    time and on every registry replacement afterwards.
+    time and on every registry replacement afterwards. A fresh graph starts at
+    ``graph_version`` 1.
     """
+
+
+class GraphReplaceRequest(ReviewRequest):
+    """A new version of an already registered graph, submitted under its id.
+
+    The shape mirrors :class:`GraphRegisterRequest` (``nodes`` + ``export``)
+    plus ``expected_version``, which must equal the graph's current version:
+    a stale expectation rejects the submission (HTTP 409) and the previous
+    version stays in place. Whole-graph validation and the registry-driven
+    review run exactly as at first registration — a blocked new version is
+    still stored — and on success the version advances by one while the
+    registry generation, sealed packages and release records are untouched.
+    """
+
+    expected_version: int = Field(ge=0)
 
 
 class GraphPreviewRequest(StrictModel):

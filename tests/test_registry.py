@@ -77,8 +77,10 @@ def test_registry_starts_empty_at_generation_zero():
 
 def test_register_runs_whole_graph_validation_and_returns_id():
     body = register()
-    assert set(body) == {"id", "nodes", "export", "generation", "review"}
+    assert set(body) == {
+        "id", "graph_version", "nodes", "export", "generation", "review"}
     assert isinstance(body["id"], str) and body["id"]
+    assert body["graph_version"] == 1
     assert body["nodes"] == GRAPH["nodes"]
     assert body["export"] == "export_users"
     assert body["generation"] == 0
